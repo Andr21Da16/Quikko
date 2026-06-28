@@ -110,9 +110,6 @@ quikko/
 │
 ├── server/
 │     Backend desarrollado en Go
-│
-└── docs/
-      Especificaciones del proyecto
 ```
 
 ---
