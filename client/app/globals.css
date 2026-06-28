@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+/*
+ * Dark mode por CLASE (no por prefers-color-scheme): Tailwind v4 usa el media query
+ * por defecto, pero next-themes alterna la clase `dark` en <html>. Este custom-variant
+ * hace que las utilidades `dark:` respondan a esa clase.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Tokens de marca Quikko. NUNCA escribir el hex suelto en un componente: usar siempre
+ * estas escalas vía utilidades (bg-brand-600, text-accent-400, etc.).
+ *
+ * Escalas 50-900 generadas por interpolación HSL a partir de los valores base dados
+ * (brand-600 = #6D28D9 violeta, accent-400 = #A3E635 lima), manteniendo el tono fijo
+ * y modulando luminosidad/saturación por paso. Los valores base están pineados exactos.
+ */
+@theme {
+  /* brand (violeta, base #6D28D9 = brand-600) */
+  --color-brand-50: #f6f2fd;
+  --color-brand-100: #ede5fb;
+  --color-brand-200: #d5c1f6;
+  --color-brand-300: #b895ef;
+  --color-brand-400: #9765e7;
+  --color-brand-500: #8042e0;
+  --color-brand-600: #6d28d9;
+  --color-brand-700: #5c1fbd;
+  --color-brand-800: #4b1b98;
+  --color-brand-900: #3b1a70;
+
+  /* accent (lima, base #A3E635 = accent-400) */
+  --color-accent-50: #f7fced;
+  --color-accent-100: #eaf9d2;
+  --color-accent-200: #daf5ad;
+  --color-accent-300: #c3ef7b;
+  --color-accent-400: #a3e635;
+  --color-accent-500: #90d322;
+  --color-accent-600: #7ab021;
+  --color-accent-700: #618820;
+  --color-accent-800: #4e6b1f;
+  --color-accent-900: #3c4f1c;
+}
+
+/* Chrome base de la página, conmutable por la clase `dark`. */
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+.dark {
+  --background: #0a0a0a;
+  --foreground: #ededed;
+}
+
+/*
+ * Fuente única del proyecto: Space Grotesk, cargada en layout.tsx vía next/font como
+ * la variable --font-space-grotesk. Mapearla a --font-sans hace que la utilidad
+ * font-sans (la fuente por defecto de Tailwind) resuelva a Space Grotesk, así ningún
+ * componente necesita una clase de fuente explícita.
+ */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-space-grotesk), system-ui, sans-serif;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}

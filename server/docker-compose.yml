@@ -1,0 +1,41 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: urlshortener-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  redis:
+    image: redis:7-alpine
+    container_name: urlshortener-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: urlshortener-influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: admin12345
+      DOCKER_INFLUXDB_INIT_ORG: url-shortener
+      DOCKER_INFLUXDB_INIT_BUCKET: clicks
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: dev-influx-token-change-me
+    volumes:
+      - influx_data:/var/lib/influxdb2
+      - influx_config:/etc/influxdb2
+
+volumes:
+  mongo_data:
+  redis_data:
+  influx_data:
+  influx_config:

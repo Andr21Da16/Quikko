@@ -1,0 +1,7 @@
+<svg width="120" height="120" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>Quikko</title>
+  <desc>Isotipo de Quikko: nodo de red en violeta con punto central en acento lima</desc>
+  <rect width="120" height="120" rx="20" fill="#6D28D9"/>
+  <circle cx="60" cy="60" r="32" fill="none" stroke="#FFFFFF" stroke-width="14"/>
+  <circle cx="60" cy="60" r="10" fill="#A3E635"/>
+</svg>

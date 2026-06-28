@@ -1,0 +1,22 @@
+<svg width="280" height="120" viewBox="0 0 280 120" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>Quikko</title>
+  <desc>Wordmark del logo de Quikko, en violeta con la segunda "o" como nodo de red en acento lima</desc>
+  <defs>
+    <style>
+      .wordmark {
+        font-family: 'Arial', 'Helvetica Neue', sans-serif;
+        font-weight: 800;
+        font-size: 64px;
+        letter-spacing: -2px;
+      }
+    </style>
+  </defs>
+
+  <text x="20" y="80" class="wordmark" fill="#6D28D9">Quikk</text>
+
+  <!-- "o" final reemplazada por un nodo circular, pegada inmediatamente al final de "Quikk" -->
+  <g transform="translate(196, 0)">
+    <circle cx="30" cy="62" r="26" fill="none" stroke="#6D28D9" stroke-width="13"/>
+    <circle cx="30" cy="62" r="8" fill="#A3E635"/>
+  </g>
+</svg>

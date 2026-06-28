@@ -1,0 +1,871 @@
+openapi: 3.0.3
+
+# Nota de servidores: la API REST vive bajo /api/v1, pero la redirección pública (GET /{code}),
+# el healthcheck (GET /health) y el WebSocket (GET /ws) cuelgan de la RAÍZ. Por eso el `server`
+# es el host raíz (http://localhost:8080) y cada path lleva su prefijo completo.
+
+info:
+  title: Quikko API
+  version: 1.0.0
+  description: |
+    API del acortador de URLs con métricas en tiempo real **Quikko**.
+
+    ## Contrato de respuesta (envelope)
+    Salvo el export CSV y la redirección, **toda** respuesta usa el envelope estándar:
+    ```json
+    { "success": true, "data": { ... }, "error": null, "meta": null }
+    ```
+    - `success: true` ⇒ `data` poblado, `error: null`.
+    - `success: false` ⇒ `data: null`, `error` con `code` y `message`.
+    - `meta` solo aparece en respuestas paginadas (se omite en el resto).
+
+    El status HTTP sigue siendo semántico (200/201/400/401/403/404/409/410/429/500).
+
+    ## Autenticación
+    Los endpoints protegidos requieren `Authorization: Bearer <accessToken>` (JWT).
+    El access token se obtiene en `register`/`login` y se renueva con `refresh`.
+    El plan (free/pro) **no** viaja en el JWT: se consulta en DB en cada operación.
+
+    ## WebSocket (tiempo real)
+    `GET /ws?token=<accessToken>` hace upgrade a WebSocket. OpenAPI 3.0 no modela
+    WebSockets; el protocolo (mensajes `subscribe`/`unsubscribe`/`click_event`/`error`)
+    está documentado en `docs/realtime-protocol.md`.
+
+servers:
+  - url: http://localhost:8080
+    description: Desarrollo local (ajustar al valor de BASE_URL si difiere)
+
+tags:
+  - name: Auth
+    description: Registro, login, sesión y gestión de cuenta
+  - name: URLs
+    description: Creación y gestión de URLs cortas (protegido)
+  - name: Analytics
+    description: Métricas agregadas de clics (protegido)
+  - name: Redirect
+    description: Redirección pública de una URL corta
+  - name: System
+    description: Healthcheck y documentación
+
+paths:
+  # ──────────────────────────────── Auth ────────────────────────────────
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Registrar un usuario nuevo
+      description: |
+        Crea el usuario (plan Free por defecto) e inmediatamente emite un par de tokens.
+        Rate limit por IP (`AUTH_RATE_LIMIT_PER_MIN`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Usuario creado y autenticado
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AuthResponse'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409':
+          description: Email ya registrado (`AUTH_EMAIL_TAKEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Iniciar sesión
+      description: |
+        Devuelve el mismo error (`AUTH_INVALID_CREDENTIALS`) tanto si el email no existe
+        como si la contraseña es incorrecta (no filtra existencia). Rate limit por IP.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Autenticado
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AuthResponse'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Credenciales inválidas (`AUTH_INVALID_CREDENTIALS`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Renovar el access token
+      description: |
+        Recibe un refresh token válido y emite un nuevo access token.
+        La respuesta solo trae `accessToken` (sin `refreshToken` ni `user`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Nuevo access token emitido
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AuthResponse'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Refresh token expirado (`AUTH_TOKEN_EXPIRED`) o inválido (`AUTH_TOKEN_INVALID`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Datos del usuario autenticado
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Usuario actual
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/UserDTO'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      tags: [Auth]
+      summary: Eliminar la propia cuenta
+      description: |
+        Exige la contraseña actual. Orquesta el borrado en cascada: purga el cache de
+        redirección de cada URL, elimina todas las URLs del usuario en Mongo y luego el
+        usuario. Los clics históricos en InfluxDB **no** se eliminan (fuera de alcance).
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteAccountRequest'
+      responses:
+        '200': { $ref: '#/components/responses/EmptySuccess' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Contraseña incorrecta (`AUTH_INVALID_CREDENTIALS`) o token inválido (`AUTH_TOKEN_INVALID`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/auth/me/plan:
+    patch:
+      tags: [Auth]
+      summary: Cambiar el plan del propio usuario
+      description: |
+        Herramienta de prueba mientras no hay pasarela de pago: cualquier usuario
+        autenticado puede cambiar su propio plan. Devuelve el usuario actualizado.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePlanRequest'
+      responses:
+        '200':
+          description: Plan actualizado
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/UserDTO'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/auth/me/password:
+    patch:
+      tags: [Auth]
+      summary: Cambiar la contraseña
+      description: Verifica la contraseña actual antes de reemplazarla.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '200': { $ref: '#/components/responses/EmptySuccess' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Contraseña actual incorrecta (`AUTH_INVALID_CREDENTIALS`) o token inválido (`AUTH_TOKEN_INVALID`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/auth/me/summary:
+    get:
+      tags: [Auth]
+      summary: Resumen de cuenta
+      description: Plan, límite de URLs activas (null si Pro), conteo de activas y total de clics.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Resumen de cuenta
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AccountSummaryResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ──────────────────────────────── URLs ────────────────────────────────
+  /api/v1/urls:
+    post:
+      tags: [URLs]
+      summary: Crear una URL corta
+      description: |
+        Crea una URL con código autogenerado o con alias propio (`customAlias`).
+        Valida la URL original (esquema http/https, no hosts locales/privados, no el
+        propio dominio del servicio) antes de tocar la base de datos. El plan Free está
+        limitado en número de URLs activas (`PLAN_LIMIT_EXCEEDED`). Rate limit por usuario.
+        La respuesta incluye el `qrCodeBase64` (QR generado on-demand, no persistido).
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateURLRequest'
+      responses:
+        '201':
+          description: URL creada
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/URLResponse'
+        '400':
+          description: Body inválido (`VALIDATION_ERROR`) o URL no permitida (`INVALID_URL`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Cupo del plan Free alcanzado (`PLAN_LIMIT_EXCEEDED`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '409':
+          description: El alias ya está en uso (`ALIAS_TAKEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    get:
+      tags: [URLs]
+      summary: Listar las URLs del usuario (paginado, con búsqueda y filtro)
+      description: |
+        Lista paginada de las URLs del usuario autenticado. Acepta filtros opcionales que
+        se resuelven en la base de datos (no en el cliente): `search` (coincidencia parcial
+        case-insensitive sobre `shortCode` u `originalUrl`, tratada como texto literal) e
+        `isActive` (`true`/`false`). `meta.total`/`meta.totalPages` reflejan el conteo YA
+        filtrado.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: search
+          in: query
+          required: false
+          description: Busca coincidencia parcial (case-insensitive) en shortCode u originalUrl.
+          schema: { type: string }
+        - name: isActive
+          in: query
+          required: false
+          description: Filtra por estado. Omitido = todas; `true` = solo activas; `false` = solo inactivas.
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Página de URLs del usuario (filtrada)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/URLResponse'
+                      meta:
+                        $ref: '#/components/schemas/Meta'
+        '400':
+          description: '`isActive` con un valor distinto de `true`/`false` (`VALIDATION_ERROR`)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/urls/check-alias:
+    get:
+      tags: [URLs]
+      summary: Comprobar disponibilidad de un alias
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: alias
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Disponibilidad del alias
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/CheckAliasResponse'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/urls/code/{shortCode}:
+    get:
+      tags: [URLs]
+      summary: Detalle de una URL por shortCode
+      description: |
+        Devuelve los metadatos + QR de una sola URL del usuario. Alimenta la pantalla
+        de detalle del frontend. Una URL ajena o inexistente devuelve `FORBIDDEN`
+        (mismo error, no filtra existencia).
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: shortCode
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Datos de la URL
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/URLResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: No es tu URL o no existe (`FORBIDDEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/urls/{id}/active:
+    patch:
+      tags: [URLs]
+      summary: Activar/desactivar una URL
+      description: |
+        Sincroniza el cache de redirección. Reactivar consume cupo del plan (puede
+        devolver `PLAN_LIMIT_EXCEEDED`). Una URL ajena o inexistente devuelve `FORBIDDEN`
+        (mismo error, no filtra existencia).
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/UrlId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToggleActiveRequest'
+      responses:
+        '200': { $ref: '#/components/responses/EmptySuccess' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: No es tu URL o no existe (`FORBIDDEN`); o cupo alcanzado al reactivar (`PLAN_LIMIT_EXCEEDED`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/urls/{id}:
+    delete:
+      tags: [URLs]
+      summary: Eliminar una URL
+      description: Una URL ajena o inexistente devuelve `FORBIDDEN` (no filtra existencia).
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/UrlId'
+      responses:
+        '200': { $ref: '#/components/responses/EmptySuccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: No es tu URL o no existe (`FORBIDDEN`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  # ───────────────────────────── Analytics ─────────────────────────────
+  /api/v1/analytics/stats:
+    get:
+      tags: [Analytics]
+      summary: Métricas agregadas
+      description: |
+        Con `shortCode` devuelve las métricas de esa URL (`FORBIDDEN` si no es tuya);
+        sin él, el overview de todas tus URLs. El plan Free está limitado al rango `24h`
+        (`PLAN_RANGE_NOT_ALLOWED` si pide 7d/30d).
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ShortCodeQuery'
+        - $ref: '#/components/parameters/RangeQuery'
+      responses:
+        '200':
+          description: Métricas
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/StatsResponse'
+        '400':
+          description: Rango inválido o params mal formados (`VALIDATION_ERROR`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: URL ajena (`FORBIDDEN`) o rango no permitido para el plan (`PLAN_RANGE_NOT_ALLOWED`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/analytics/stats/export:
+    get:
+      tags: [Analytics]
+      summary: Exportar métricas a CSV
+      description: |
+        Mismas métricas y validaciones que `/analytics/stats`, pero el camino feliz
+        responde un archivo CSV crudo (BOM UTF-8 + CRLF para Excel), **no** el envelope
+        JSON. Los errores sí usan el envelope JSON estándar.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ShortCodeQuery'
+        - $ref: '#/components/parameters/RangeQuery'
+      responses:
+        '200':
+          description: Archivo CSV (Content-Disposition de descarga)
+          headers:
+            Content-Disposition:
+              description: 'attachment; filename="stats-<label>-<range>.csv"'
+              schema: { type: string }
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Params inválidos (`VALIDATION_ERROR`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: URL ajena (`FORBIDDEN`) o rango no permitido para el plan (`PLAN_RANGE_NOT_ALLOWED`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  # ───────────────────────────── Redirect ──────────────────────────────
+  /{code}:
+    get:
+      tags: [Redirect]
+      summary: Redirigir una URL corta
+      description: |
+        Endpoint público en la raíz. Resuelve el código (Redis primero, fallback a
+        Mongo) y responde `302` con `Location`. El registro del clic y el incremento del
+        contador son asíncronos y no afectan la respuesta. Rate limit por IP.
+      security: []
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '302':
+          description: Redirección a la URL original
+          headers:
+            Location:
+              description: URL original de destino
+              schema: { type: string, format: uri }
+        '404':
+          description: Código inexistente (`URL_NOT_FOUND`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '410':
+          description: URL desactivada (`URL_INACTIVE`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ────────────────────────────── System ───────────────────────────────
+  /health:
+    get:
+      tags: [System]
+      summary: Healthcheck
+      description: |
+        Readiness probe. **No** usa el envelope estándar: responde un JSON plano
+        `{ "status": "ok" }`.
+      security: []
+      responses:
+        '200':
+          description: Servicio operativo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'JWT de acceso: `Authorization: Bearer <accessToken>`'
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      required: false
+      description: Página (default 1)
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Tamaño de página (default 20, máximo 100, se clampea)
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    UrlId:
+      name: id
+      in: path
+      required: true
+      description: ID hex de la URL (ObjectID de Mongo)
+      schema: { type: string }
+    ShortCodeQuery:
+      name: shortCode
+      in: query
+      required: false
+      description: Código de la URL; si se omite, vista overview de todas las del usuario
+      schema: { type: string }
+    RangeQuery:
+      name: range
+      in: query
+      required: false
+      description: Rango temporal (default 24h)
+      schema:
+        type: string
+        enum: [24h, 7d, 30d]
+        default: 24h
+
+  responses:
+    EmptySuccess:
+      description: 'Operación exitosa sin payload (data: null)'
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Envelope'
+              - type: object
+                properties:
+                  data:
+                    description: Sin payload en esta operación (siempre null).
+                    example: null
+    ValidationError:
+      description: Body o parámetros inválidos (`VALIDATION_ERROR`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unauthorized:
+      description: Falta el token o es inválido/expirado (`AUTH_TOKEN_INVALID` / `AUTH_TOKEN_EXPIRED`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RateLimited:
+      description: Límite de peticiones excedido (`RATE_LIMIT_EXCEEDED`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    InternalError:
+      description: Error interno (`INTERNAL_ERROR`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    # ── Envelope estándar (modelado una sola vez, reutilizado vía allOf/$ref) ──
+    Envelope:
+      type: object
+      description: Sobre común de toda respuesta JSON de la API.
+      required: [success, data, error]
+      properties:
+        success:
+          type: boolean
+        data:
+          description: |
+            Payload del endpoint (su forma se especializa por respuesta vía allOf).
+            Es `null` cuando `success` es false.
+        error:
+          description: 'Poblado solo cuando `success` es false; `null` en caso de éxito.'
+          allOf:
+            - $ref: '#/components/schemas/ApiError'
+        meta:
+          description: Presente solo en respuestas paginadas.
+          allOf:
+            - $ref: '#/components/schemas/Meta'
+    ErrorEnvelope:
+      type: object
+      description: 'Envelope de error (success: false, data: null, error poblado).'
+      required: [success, data, error]
+      properties:
+        success: { type: boolean, example: false }
+        data:
+          description: Siempre null en una respuesta de error.
+          example: null
+        error:
+          $ref: '#/components/schemas/ApiError'
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Código de error estable
+          example: VALIDATION_ERROR
+        message:
+          type: string
+          example: Cuerpo de la solicitud inválido.
+    Meta:
+      type: object
+      description: Bloque de paginación (solo en listados).
+      required: [page, limit, total, totalPages]
+      properties:
+        page: { type: integer, example: 1 }
+        limit: { type: integer, example: 20 }
+        total: { type: integer, format: int64, example: 134 }
+        totalPages: { type: integer, example: 7 }
+
+    # ── Auth ──
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8, example: superSecret1 }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string }
+    UpdatePlanRequest:
+      type: object
+      required: [plan]
+      properties:
+        plan:
+          type: string
+          enum: [free, pro]
+    ChangePasswordRequest:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword: { type: string }
+        newPassword: { type: string, minLength: 8 }
+    DeleteAccountRequest:
+      type: object
+      required: [password]
+      properties:
+        password: { type: string }
+    AuthResponse:
+      type: object
+      description: |
+        En register/login trae accessToken + refreshToken + user. En refresh solo
+        trae accessToken (refreshToken y user se omiten).
+      required: [accessToken]
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        user:
+          $ref: '#/components/schemas/UserDTO'
+    UserDTO:
+      type: object
+      required: [id, email, plan]
+      properties:
+        id: { type: string }
+        email: { type: string, format: email }
+        plan:
+          type: string
+          enum: [free, pro]
+    AccountSummaryResponse:
+      type: object
+      required: [email, plan, createdAt, activeUrlsCount, totalClicks]
+      properties:
+        email: { type: string, format: email }
+        plan:
+          type: string
+          enum: [free, pro]
+        createdAt: { type: string, format: date-time }
+        activeUrlsCount: { type: integer, format: int64 }
+        activeUrlsLimit:
+          type: integer
+          nullable: true
+          description: Límite de URLs activas del plan Free; null si Pro (ilimitado).
+        totalClicks: { type: integer, format: int64 }
+
+    # ── URLs ──
+    CreateURLRequest:
+      type: object
+      required: [originalUrl]
+      properties:
+        originalUrl:
+          type: string
+          format: uri
+          example: https://google.com
+        customAlias:
+          type: string
+          nullable: true
+          minLength: 3
+          maxLength: 30
+          description: Alias alfanumérico opcional; si se omite, se autogenera un código.
+          example: mi-promo
+    URLResponse:
+      type: object
+      required: [id, shortCode, shortUrl, originalUrl, isCustomAlias, isActive, createdAt, totalClicks, qrCodeBase64]
+      properties:
+        id: { type: string }
+        shortCode: { type: string, example: xYz12A }
+        shortUrl: { type: string, format: uri, example: 'http://localhost:8080/xYz12A' }
+        originalUrl: { type: string, format: uri }
+        isCustomAlias: { type: boolean }
+        isActive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        totalClicks:
+          type: integer
+          format: int64
+          description: Contador aproximado de clics de la URL (fire-and-forget; la verdad fina está en InfluxDB).
+        qrCodeBase64:
+          type: string
+          description: QR del shortUrl como data URI (data:image/png;base64,...). Vacío si falló su generación.
+    CheckAliasResponse:
+      type: object
+      required: [alias, available]
+      properties:
+        alias: { type: string }
+        available: { type: boolean }
+    ToggleActiveRequest:
+      type: object
+      required: [isActive]
+      properties:
+        isActive: { type: boolean }
+
+    # ── Analytics ──
+    StatsResponse:
+      type: object
+      required: [range, stats]
+      properties:
+        range:
+          type: string
+          enum: [24h, 7d, 30d]
+        stats:
+          $ref: '#/components/schemas/ClickStats'
+    ClickStats:
+      type: object
+      required: [totalClicks, clicksByCountry, clicksByDevice, clicksByBrowser, clicksOverTime]
+      properties:
+        totalClicks: { type: integer, format: int64 }
+        clicksByCountry:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+        clicksByDevice:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+        clicksByBrowser:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+        clicksOverTime:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeBucket'
+    TimeBucket:
+      type: object
+      required: [timestamp, count]
+      properties:
+        timestamp: { type: string, format: date-time }
+        count: { type: integer, format: int64 }
+
+security:
+  - bearerAuth: []

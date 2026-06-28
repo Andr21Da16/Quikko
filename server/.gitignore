@@ -1,0 +1,12 @@
+# Entorno local
+.env
+
+# Base GeoIP (licencia MaxMind, no se commitea)
+data/*.mmdb
+
+# Binarios
+/api
+*.exe
+
+# OS
+.DS_Store
