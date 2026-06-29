@@ -58,10 +58,9 @@ Ambos proyectos pueden ejecutarse de forma independiente o como una única plata
 
 | Application | Link |
 |-------------|------|
-| 🌐 Website | https://quikko.up.railway.app |
-| 📊 Dashboard | https://quikko.up.railway.app/dashboard |
-| 📖 Swagger UI | https://quikko-api.up.railway.app/docs |
-| ❤️ Health Check | https://quikko-api.up.railway.app/health |
+| 🌐 Website | https://quikko.vercel.app/ |
+| 📖 Swagger UI | https://quikko-production.up.railway.app/docs |
+| ❤️ Health Check | https://quikko-production.up.railway.app/health |
 
 > [!TIP]
 > The demo environment is automatically deployed from the latest version of the `main` branch.
