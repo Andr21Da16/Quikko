@@ -12,7 +12,7 @@ import type { ClickEvent } from "@/types";
 import { useAuthStore } from "./auth";
 import { useNotificationsStore } from "./notifications";
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8080";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL;
 const MAX_EVENTS = 50; // buffer corto de contexto reciente
 const BASE_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30000;

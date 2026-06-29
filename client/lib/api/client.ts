@@ -6,6 +6,7 @@ import { session } from "./session";
 const API_URL =
   process.env.NEXT_PUBLIC_API_URL;
 
+console.log("API_URL:", API_URL);
 // Código del backend que indica access token expirado → dispara el silent refresh.
 export const AUTH_TOKEN_EXPIRED = "AUTH_TOKEN_EXPIRED";
 
